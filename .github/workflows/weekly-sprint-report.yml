@@ -34,10 +34,16 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Write service account key to disk
-        # The secret holds the full service-account JSON. We materialise it to a
-        # file the Google client can read, then delete it in the final step.
+        # The secret holds the full service-account JSON. We pass it through the
+        # environment (not interpolated into the command) so the shell never
+        # interprets the backslash escapes inside the private_key field, then
+        # write it verbatim with a tool that does no escape processing.
+        # The file is deleted again in the cleanup step below.
+        env:
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
         run: |
-          printf '%s' "${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}" > service_account.json
+          printf '%s' "$GCP_SERVICE_ACCOUNT_KEY" > service_account.json
+          python -c "import json; json.load(open('service_account.json')); print('service_account.json is valid JSON')"
 
       - name: Run sprint report refresh
         env:
