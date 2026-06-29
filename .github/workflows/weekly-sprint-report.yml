@@ -1,0 +1,94 @@
+name: Weekly SP Sprint Report
+
+# Runs every Thursday at 07:00 UTC (08:00 BST in summer).
+# Adjust the cron if you need a different time — note GitHub schedules use UTC.
+# You can also run it on demand via the "Run workflow" button (workflow_dispatch).
+on:
+  schedule:
+    - cron: "0 7 * * 4"   # min hour day-of-month month day-of-week(4 = Thursday)
+  workflow_dispatch: {}
+
+# Prevent two runs overlapping if a manual run coincides with the schedule.
+concurrency:
+  group: sprint-report
+  cancel-in-progress: false
+
+# Needed so the keepalive step can push a commit back to the repo.
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write service account key to disk
+        # The secret holds the full service-account JSON. We materialise it to a
+        # file the Google client can read, then delete it in the final step.
+        run: |
+          printf '%s' "${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}" > service_account.json
+
+      - name: Run sprint report refresh
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY || 'SP' }}
+          GCP_SA_KEY_PATH: service_account.json
+        run: python src/refresh_sprint_report.py
+
+      - name: Clean up service account key
+        if: always()
+        run: rm -f service_account.json
+
+      # ---------------------------------------------------------------------
+      # Keepalive. GitHub disables a scheduled workflow after 60 days with NO
+      # repo commit activity. This step writes a timestamp file and commits it
+      # each run (weekly, well inside 60 days) so the schedule never lapses.
+      #
+      # CAVEAT (read HANDOVER.md): a commit authored by the default GITHUB_TOKEN
+      # does NOT always reset the 60-day idle timer. As a belt-and-braces backup,
+      # the next step also calls the API to explicitly re-enable this workflow,
+      # which is the reliable guarantee. Keep both.
+      #
+      # A keepalive only protects an otherwise-healthy job. If the real run above
+      # has been failing for weeks (e.g. broken credentials) and nobody fixes it,
+      # the workflow can still end up disabled — see HANDOVER.md troubleshooting.
+      # ---------------------------------------------------------------------
+      - name: Keepalive — timestamp commit
+        if: always()
+        run: |
+          mkdir -p .keepalive
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive/last-run.txt
+          git config user.name "sprint-report-bot"
+          git config user.email "actions@github.com"
+          git add .keepalive/last-run.txt
+          if git diff --staged --quiet; then
+            echo "No keepalive change to commit."
+          else
+            git commit -m "chore: keepalive timestamp [skip ci]"
+            git push
+          fi
+
+      - name: Keepalive — ensure workflow stays enabled
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Re-enable this workflow via the API in case it was auto-disabled.
+          # Harmless no-op if it is already enabled.
+          gh api --method PUT \
+            "repos/${{ github.repository }}/actions/workflows/weekly-sprint-report.yml/enable" \
+            && echo "Workflow confirmed enabled." || echo "Enable call returned non-zero (often already enabled) — ignoring."
