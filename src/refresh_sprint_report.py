@@ -124,9 +124,14 @@ def is_sec(components):
 def build_status_column(delivered, finished, in_prog, open_i):
     """Returns the ordered values for one weekly column of 'Current Ticket Status'."""
     comp = {"iOS": 0, "Android": 0, "RN": 0, "BED": 0, "FED": 0}
+    missing_component = 0
     for i in open_i:
-        for c in get_tech(i["components"]):
-            comp[c] += 1
+        tech = get_tech(i["components"])
+        if tech:
+            for c in tech:
+                comp[c] += 1
+        else:
+            missing_component += 1
 
     needs_testing = len(delivered)
     awaiting_pr = len(finished)
@@ -136,16 +141,17 @@ def build_status_column(delivered, finished, in_prog, open_i):
     # Order matches the sheet rows top-to-bottom.
     # 'Unsolved ZD Total' is intentionally left blank (manual entry).
     return [
-        needs_testing,      # Needs Testing
-        awaiting_pr,        # Awaiting PR
-        in_progress,        # In Progress
-        comp["iOS"],        # iOS Pending
-        comp["Android"],    # Android Pending
-        comp["RN"],         # RN Pending
-        comp["BED"],        # BED Pending
-        comp["FED"],        # FED Pending
-        jira_total,         # JIRA Total
-        "",                 # Unsolved ZD Total (manual)
+        needs_testing,          # row 2  Needs Testing
+        awaiting_pr,            # row 3  Awaiting PR
+        in_progress,            # row 4  In Progress
+        comp["iOS"],            # row 5  iOS Pending
+        comp["Android"],        # row 6  Android Pending
+        comp["RN"],             # row 7  RN Pending
+        comp["BED"],            # row 8  BED Pending
+        comp["FED"],            # row 9  FED Pending
+        missing_component,      # row 10 Missing Component - Needs Attention
+        jira_total,             # row 11 JIRA Total
+        "",                     # row 12 Unsolved ZD Total (manual)
     ]
 
 
@@ -160,14 +166,22 @@ def project_display_name(parent_summary):
 
 
 def build_project_table(delivered, finished, in_prog, open_i):
-    """Returns rows for 'Tickets By Project', sorted by total desc, plus a Total row."""
+    """Returns rows for 'Tickets By Project', sorted by total desc, plus a Total row.
+
+    Every ticket is counted exactly once. Tickets with no parent epic are kept
+    under an explicit 'Missing parent' row rather than dropped, so the grand
+    total always reconciles with the JIRA Total on the status tab.
+    """
+    MISSING_PARENT = "__none__"
     all_issues = delivered + finished + in_prog + open_i
     projects = {}
     for i in all_issues:
-        pk = i["parent_key"] or "__none__"
+        pk = i["parent_key"] or MISSING_PARENT
         if pk not in projects:
+            name = "Missing parent" if pk == MISSING_PARENT else project_display_name(i["parent_summary"])
             projects[pk] = {
-                "name": project_display_name(i["parent_summary"]),
+                "key": pk,
+                "name": name,
                 "nt": 0, "pr": 0, "ip": 0, "td": 0, "sec": 0,
             }
         p = projects[pk]
@@ -185,7 +199,12 @@ def build_project_table(delivered, finished, in_prog, open_i):
 
     rows = []
     grand_total = 0
-    ordered = sorted(projects.values(), key=lambda p: -(p["nt"] + p["pr"] + p["ip"] + p["td"]))
+    # Sort by total desc, but always pin 'Missing parent' to the bottom so it
+    # reads as an exceptions row rather than a project.
+    ordered = sorted(
+        projects.values(),
+        key=lambda p: (p["key"] == MISSING_PARENT, -(p["nt"] + p["pr"] + p["ip"] + p["td"])),
+    )
     for p in ordered:
         total = p["nt"] + p["pr"] + p["ip"] + p["td"]
         if total == 0:
@@ -225,17 +244,22 @@ def col_letter(idx):
 
 
 def _sheet_meta(svc, tab_name):
-    """Return (sheetId, columnCount) for the named tab."""
+    """Return (sheetId, columnCount, rowCount) for the named tab."""
     meta = svc.spreadsheets().get(
         spreadsheetId=GOOGLE_SHEET_ID,
-        fields="sheets(properties(sheetId,title,gridProperties(columnCount)))",
+        fields="sheets(properties(sheetId,title,gridProperties(columnCount,rowCount)))",
     ).execute()
     for s in meta.get("sheets", []):
         props = s["properties"]
         if props["title"] == tab_name:
-            cols = props.get("gridProperties", {}).get("columnCount", 0)
-            return props["sheetId"], cols
+            grid = props.get("gridProperties", {})
+            return props["sheetId"], grid.get("columnCount", 0), grid.get("rowCount", 0)
     raise RuntimeError(f"Tab {tab_name!r} not found in spreadsheet")
+
+
+def _sheet_meta_rows(svc, tab_name):
+    """Convenience wrapper returning (sheetId, columnCount, rowCount)."""
+    return _sheet_meta(svc, tab_name)
 
 
 def _last_nonempty_index(row):
@@ -272,7 +296,7 @@ def append_status_column(svc, status_values, date_label):
     letter = col_letter(target_col)
 
     # Widen the grid only if we genuinely need a column that doesn't exist yet.
-    sheet_id, col_count = _sheet_meta(svc, STATUS_TAB)
+    sheet_id, col_count, _row_count = _sheet_meta(svc, STATUS_TAB)
     if target_col > col_count:
         svc.spreadsheets().batchUpdate(
             spreadsheetId=GOOGLE_SHEET_ID,
@@ -299,16 +323,34 @@ def append_status_column(svc, status_values, date_label):
 def overwrite_project_table(svc, rows, total_row):
     """Overwrite 'Tickets By Project' data rows. Assumes row 1 is the header.
 
-    Clears existing data (rows 2 down) then writes the new table + total row.
+    Ensures the grid has enough rows for the new table (growing it if this week
+    has more projects than the sheet currently has rows), clears the old data,
+    then writes the new table + total row.
     """
-    # Clear a generous range first (rows 2..200, cols A..G)
-    svc.spreadsheets().values().clear(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"'{PROJECT_TAB}'!A2:G200",
-    ).execute()
-
     body_rows = rows + [total_row]
     end_row = 1 + len(body_rows)
+
+    # Make sure the grid is tall enough BEFORE we write, otherwise rows beyond
+    # the current grid height are silently lost / rejected.
+    sheet_id, _cols, row_count = _sheet_meta_rows(svc, PROJECT_TAB)
+    if end_row > row_count:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body={"requests": [{
+                "appendDimension": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "length": end_row - row_count,
+                }
+            }]},
+        ).execute()
+
+    # Clear old data from row 2 to the bottom of the (possibly grown) grid.
+    svc.spreadsheets().values().clear(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"'{PROJECT_TAB}'!A2:G",
+    ).execute()
+
     svc.spreadsheets().values().update(
         spreadsheetId=GOOGLE_SHEET_ID,
         range=f"'{PROJECT_TAB}'!A2:G{end_row}",
@@ -337,14 +379,16 @@ def main():
 
     status_values = build_status_column(delivered, finished, in_prog, open_i)
     proj_rows, total_row = build_project_table(delivered, finished, in_prog, open_i)
-    print(f"  JIRA Total:  {status_values[8]}")
+    jira_total = status_values[-2]   # JIRA Total is the second-to-last row (before ZD)
+    print(f"  JIRA Total:  {jira_total}")
+    print(f"  Missing component (Open): {status_values[8]}")
     print(f"  Projects:    {len(proj_rows)} rows, grand total {total_row[1]}")
 
-    if status_values[8] != total_row[1]:
+    if jira_total != total_row[1]:
         print(
-            f"WARNING: JIRA Total ({status_values[8]}) != project grand total "
-            f"({total_row[1]}). Tickets with no parent are excluded from the "
-            f"project table; investigate if unexpected.",
+            f"WARNING: JIRA Total ({jira_total}) != project grand total "
+            f"({total_row[1]}). With no-parent tickets now bucketed under "
+            f"'Missing parent', these should match — investigate if they don't.",
             file=sys.stderr,
         )
 
