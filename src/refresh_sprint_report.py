@@ -224,22 +224,66 @@ def col_letter(idx):
     return s
 
 
+def _sheet_meta(svc, tab_name):
+    """Return (sheetId, columnCount) for the named tab."""
+    meta = svc.spreadsheets().get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        fields="sheets(properties(sheetId,title,gridProperties(columnCount)))",
+    ).execute()
+    for s in meta.get("sheets", []):
+        props = s["properties"]
+        if props["title"] == tab_name:
+            cols = props.get("gridProperties", {}).get("columnCount", 0)
+            return props["sheetId"], cols
+    raise RuntimeError(f"Tab {tab_name!r} not found in spreadsheet")
+
+
+def _last_nonempty_index(row):
+    """0-based index of the last cell with non-whitespace content; -1 if none."""
+    last = -1
+    for i, v in enumerate(row):
+        if str(v).strip() != "":
+            last = i
+    return last
+
+
 def append_status_column(svc, status_values, date_label):
     """Append a new dated column to 'Current Ticket Status'.
 
-    Assumes row 1 holds the date headers and rows 2..11 hold the metric values,
-    matching the sheet layout (Needs Testing in row 2 ... Unsolved ZD Total in row 11).
-    Finds the first empty header column and writes there.
+    Row 1 holds the date headers; rows 2..11 hold the metric values
+    (Needs Testing in row 2 ... Unsolved ZD Total in row 11).
+
+    The next column is found by scanning the header row for the last cell that
+    ACTUALLY has content and writing immediately after it. We deliberately do
+    not use len(header)+1, because the API can return trailing empty cells
+    (when the grid is wider than the data), which would push the write past the
+    grid edge. If the target column would exceed the sheet width, the grid is
+    widened by one column first.
     """
-    # Read row 1 to find how many columns are populated
     header_resp = svc.spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEET_ID,
         range=f"'{STATUS_TAB}'!1:1",
     ).execute()
     header_row = header_resp.get("values", [[]])
     existing = header_row[0] if header_row else []
-    target_col = len(existing) + 1  # next empty column (1-based)
+
+    last_filled = _last_nonempty_index(existing)   # 0-based; -1 if row empty
+    target_col = last_filled + 2                    # 1-based col after last content
     letter = col_letter(target_col)
+
+    # Widen the grid only if we genuinely need a column that doesn't exist yet.
+    sheet_id, col_count = _sheet_meta(svc, STATUS_TAB)
+    if target_col > col_count:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            body={"requests": [{
+                "appendDimension": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "length": target_col - col_count,
+                }
+            }]},
+        ).execute()
 
     # Column payload: header + 10 metric rows (rows 1..11)
     column = [[date_label]] + [[v] for v in status_values]
