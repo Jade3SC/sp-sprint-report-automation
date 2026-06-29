@@ -213,7 +213,8 @@ def build_project_table(delivered, finished, in_prog, open_i):
             p["sec"] += 1
 
     rows = []
-    grand_total = 0
+    grand_total = 0    # full total incl. security (must equal JIRA Total)
+    grand_sec = 0      # total security tickets across all projects
     # Sort by total desc, but always pin 'Missing parent' to the bottom so it
     # reads as an exceptions row rather than a project.
     ordered = sorted(
@@ -225,10 +226,16 @@ def build_project_table(delivered, finished, in_prog, open_i):
         if total == 0:
             continue
         grand_total += total
+        grand_sec += p["sec"]
+        # 'Tickets' excludes security tickets so they aren't double-counted
+        # (they're shown only in the Security column). Status breakdown columns
+        # keep their FULL counts including security, matching the source sheet:
+        # per project, Tickets + Security == To Do + In Progress + Awaiting PR + Delivered.
+        non_sec = total - p["sec"]
         # Columns: Project | Tickets | Security | To Do | In Progress | Awaiting PR | Delivered
         rows.append([
             p["name"],
-            total,
+            non_sec if non_sec > 0 else "-",
             p["sec"] if p["sec"] > 0 else "-",
             p["td"] if p["td"] > 0 else "-",
             p["ip"] if p["ip"] > 0 else "-",
@@ -236,7 +243,10 @@ def build_project_table(delivered, finished, in_prog, open_i):
             p["nt"] if p["nt"] > 0 else "-",
         ])
 
-    total_row = ["Total", grand_total, "", "", "", "", ""]
+    # Total row: Tickets = non-security grand total, Security = security grand
+    # total. Kept numeric so Tickets + Security reconciles to the JIRA Total.
+    grand_tickets = grand_total - grand_sec
+    total_row = ["Total", grand_tickets, grand_sec, "", "", "", ""]
     return rows, total_row
 
 
@@ -493,15 +503,20 @@ def main():
     proj_rows, total_row = build_project_table(delivered, finished, in_prog, open_i)
     status_map = dict(status_metrics)
     jira_total = status_map["JIRA Total"]
+    # total_row is ["Total", tickets_excl_security, security, ...]; the full
+    # grand total is Tickets + Security and must match the JIRA Total.
+    project_grand_total = total_row[1] + total_row[2]
     print(f"  JIRA Total:  {jira_total}")
     print(f"  Missing component (Open): {status_map['Missing Component']}")
-    print(f"  Projects:    {len(proj_rows)} rows, grand total {total_row[1]}")
+    print(f"  Projects:    {len(proj_rows)} rows, "
+          f"grand total {project_grand_total} (tickets {total_row[1]} + security {total_row[2]})")
 
-    if jira_total != total_row[1]:
+    if jira_total != project_grand_total:
         print(
             f"WARNING: JIRA Total ({jira_total}) != project grand total "
-            f"({total_row[1]}). With no-parent tickets now bucketed under "
-            f"'Missing parent', these should match — investigate if they don't.",
+            f"({project_grand_total} = tickets {total_row[1]} + security {total_row[2]}). "
+            f"With no-parent tickets bucketed under 'Missing parent', these should "
+            f"match — investigate if they don't.",
             file=sys.stderr,
         )
 
