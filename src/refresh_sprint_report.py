@@ -41,6 +41,11 @@ PROJECT_KEY = os.environ.get("JIRA_PROJECT_KEY", "SP")
 STATUS_TAB = "Current Ticket Status"
 PROJECT_TAB = "Tickets By Project"
 
+# Logical column order produced by build_project_table(); these are matched to
+# the sheet's row-1 headers at write time so a spacer/divider column between
+# Security and the status columns (or any header reorder) won't misalign data.
+PROJECT_COLUMNS = ["Project", "Tickets", "Security", "To Do", "In Progress", "Awaiting PR", "Delivered"]
+
 # Component name -> dashboard label
 COMP_MAP = {"iOS": "iOS", "Android": "Android", "React Native": "RN", "BED": "BED", "FED": "FED"}
 IN_PROG_STATUSES = {"In Progress", "Awaiting Response"}
@@ -377,17 +382,59 @@ def append_status_column(svc, status_metrics, date_label):
 
 
 def overwrite_project_table(svc, rows, total_row):
-    """Overwrite 'Tickets By Project' data rows. Assumes row 1 is the header.
+    """Overwrite 'Tickets By Project', matching each value column to the sheet
+    column whose row-1 header matches.
 
-    Ensures the grid has enough rows for the new table (growing it if this week
-    has more projects than the sheet currently has rows), clears the old data,
-    then writes the new table + total row.
+    The tab has a styled spacer/divider column between 'Security' and the status
+    columns. Writing a contiguous A:G block ignored that gap and shifted every
+    status value one column left. Instead we read row 1, locate each header, and
+    write each logical column into its own matched column — so the spacer (and
+    any future header reorder) is handled automatically.
+
+    Rows beyond the current grid height are added first; if this week has more
+    projects than last week the table grows rather than dropping rows.
     """
-    body_rows = rows + [total_row]
+    # --- locate each logical column by its row-1 header ---
+    header_resp = svc.spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"'{PROJECT_TAB}'!1:1",
+    ).execute()
+    header = header_resp.get("values") or [[]]
+    header = header[0] if header else []
+    norm_header = {}
+    for idx, cell in enumerate(header):
+        n = _normalise_label(cell)
+        if n and n not in norm_header:
+            norm_header[n] = idx  # 0-based column index
+
+    def col_for(name):
+        n = _normalise_label(name)
+        if n in norm_header:
+            return norm_header[n]
+        for hn, i in norm_header.items():
+            if hn.startswith(n):
+                return i
+        return None
+
+    col_idx = {}
+    missing = []
+    for name in PROJECT_COLUMNS:
+        ci = col_for(name)
+        if ci is None:
+            missing.append(name)
+        else:
+            col_idx[name] = ci
+    if missing:
+        raise RuntimeError(
+            f"Could not find these headers in row 1 of '{PROJECT_TAB}': {missing}. "
+            f"Each must match (a prefix of) a header cell. Fix the headers and "
+            f"re-run — no data was written."
+        )
+
+    body_rows = rows + [total_row]            # each row in PROJECT_COLUMNS order
     end_row = 1 + len(body_rows)
 
-    # Make sure the grid is tall enough BEFORE we write, otherwise rows beyond
-    # the current grid height are silently lost / rejected.
+    # Grow the grid (rows) if this week needs more than the sheet currently has.
     sheet_id, _cols, row_count = _sheet_meta_rows(svc, PROJECT_TAB)
     if end_row > row_count:
         svc.spreadsheets().batchUpdate(
@@ -401,17 +448,26 @@ def overwrite_project_table(svc, rows, total_row):
             }]},
         ).execute()
 
-    # Clear old data from row 2 to the bottom of the (possibly grown) grid.
+    # Clear old data values across the owned span (row 2 down). Clearing values
+    # leaves the spacer column's fill/formatting intact.
+    max_letter = col_letter(max(col_idx.values()) + 1)
     svc.spreadsheets().values().clear(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"'{PROJECT_TAB}'!A2:G",
+        range=f"'{PROJECT_TAB}'!A2:{max_letter}",
     ).execute()
 
-    svc.spreadsheets().values().update(
+    # Write each logical column into its matched sheet column.
+    data = []
+    for j, name in enumerate(PROJECT_COLUMNS):
+        letter = col_letter(col_idx[name] + 1)
+        col_values = [[body_rows[r][j]] for r in range(len(body_rows))]
+        data.append({
+            "range": f"'{PROJECT_TAB}'!{letter}2:{letter}{end_row}",
+            "values": col_values,
+        })
+    svc.spreadsheets().values().batchUpdate(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"'{PROJECT_TAB}'!A2:G{end_row}",
-        valueInputOption="USER_ENTERED",
-        body={"values": body_rows},
+        body={"valueInputOption": "USER_ENTERED", "data": data},
     ).execute()
 
 
