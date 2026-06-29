@@ -122,7 +122,18 @@ def is_sec(components):
 
 
 def build_status_column(delivered, finished, in_prog, open_i):
-    """Returns the ordered values for one weekly column of 'Current Ticket Status'."""
+    """Returns an ordered list of (row_label, value) for one weekly column.
+
+    Values are matched to sheet rows by their column-A label at write time, so
+    the tab's row order is the source of truth: inserting or reordering rows in
+    'Current Ticket Status' will not misalign the data. 'Unsolved ZD Total' is
+    deliberately omitted from the list (left blank for manual entry).
+
+    The label strings here must match (a prefix of) the labels in column A.
+    Matching is case-insensitive and whitespace-normalised, and a metric label
+    is allowed to be a prefix of the sheet label (so the sheet may read
+    "Missing Component - Needs Attention" while the metric is "Missing Component").
+    """
     comp = {"iOS": 0, "Android": 0, "RN": 0, "BED": 0, "FED": 0}
     missing_component = 0
     for i in open_i:
@@ -138,21 +149,20 @@ def build_status_column(delivered, finished, in_prog, open_i):
     in_progress = len(in_prog)
     jira_total = needs_testing + awaiting_pr + in_progress + len(open_i)
 
-    # Order matches the sheet rows top-to-bottom.
-    # 'Unsolved ZD Total' is intentionally left blank (manual entry).
     return [
-        needs_testing,          # row 2  Needs Testing
-        awaiting_pr,            # row 3  Awaiting PR
-        in_progress,            # row 4  In Progress
-        comp["iOS"],            # row 5  iOS Pending
-        comp["Android"],        # row 6  Android Pending
-        comp["RN"],             # row 7  RN Pending
-        comp["BED"],            # row 8  BED Pending
-        comp["FED"],            # row 9  FED Pending
-        missing_component,      # row 10 Missing Component - Needs Attention
-        jira_total,             # row 11 JIRA Total
-        "",                     # row 12 Unsolved ZD Total (manual)
+        ("Needs Testing", needs_testing),
+        ("Awaiting PR", awaiting_pr),
+        ("In Progress", in_progress),
+        ("iOS Pending", comp["iOS"]),
+        ("Android Pending", comp["Android"]),
+        ("RN Pending", comp["RN"]),
+        ("BED Pending", comp["BED"]),
+        ("FED Pending", comp["FED"]),
+        ("Missing Component", missing_component),
+        ("JIRA Total", jira_total),
+        # 'Unsolved ZD Total' intentionally not written (manual entry).
     ]
+
 
 
 # Strip the [TAG] prefix and known project-name normalisations for display
@@ -271,26 +281,36 @@ def _last_nonempty_index(row):
     return last
 
 
-def append_status_column(svc, status_values, date_label):
+def _normalise_label(s):
+    """Lower-case, trim, collapse internal whitespace — for tolerant matching."""
+    return " ".join(str(s).strip().lower().split())
+
+
+def append_status_column(svc, status_metrics, date_label):
     """Append a new dated column to 'Current Ticket Status'.
 
-    Row 1 holds the date headers; rows 2..11 hold the metric values
-    (Needs Testing in row 2 ... Unsolved ZD Total in row 11).
+    Two independent lookups make this robust:
 
-    The next column is found by scanning the header row for the last cell that
-    ACTUALLY has content and writing immediately after it. We deliberately do
-    not use len(header)+1, because the API can return trailing empty cells
-    (when the grid is wider than the data), which would push the write past the
-    grid edge. If the target column would exceed the sheet width, the grid is
-    widened by one column first.
+    1. TARGET COLUMN — found by scanning row 1 for the last cell that actually
+       has content and writing immediately after it (so trailing empty/hidden
+       columns don't push the write off-grid). The grid is widened if needed.
+
+    2. TARGET ROW per metric — found by matching each metric's label against the
+       labels in column A (case-insensitive, whitespace-normalised, with the
+       metric label allowed to be a prefix of the sheet label). This means the
+       sheet's row order is the source of truth: inserting or reordering rows
+       will never misalign the data again.
+
+    If any metric's label can't be located in column A, the run fails loudly
+    (listing the missing labels) rather than writing partial/misaligned data.
     """
+    # --- 1. target column from header row ---
     header_resp = svc.spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEET_ID,
         range=f"'{STATUS_TAB}'!1:1",
     ).execute()
     header_row = header_resp.get("values", [[]])
     existing = header_row[0] if header_row else []
-
     last_filled = _last_nonempty_index(existing)   # 0-based; -1 if row empty
     target_col = last_filled + 2                    # 1-based col after last content
     letter = col_letter(target_col)
@@ -309,13 +329,49 @@ def append_status_column(svc, status_values, date_label):
             }]},
         ).execute()
 
-    # Column payload: header + 10 metric rows (rows 1..11)
-    column = [[date_label]] + [[v] for v in status_values]
-    svc.spreadsheets().values().update(
+    # --- 2. map each metric to its row via column-A labels ---
+    labels_resp = svc.spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"'{STATUS_TAB}'!{letter}1:{letter}{len(column)}",
-        valueInputOption="USER_ENTERED",
-        body={"values": column},
+        range=f"'{STATUS_TAB}'!A:A",
+    ).execute()
+    label_rows = labels_resp.get("values", [])
+    norm_to_row = {}
+    for idx, row in enumerate(label_rows):
+        cell = row[0] if row else ""
+        norm = _normalise_label(cell)
+        if norm and norm not in norm_to_row:
+            norm_to_row[norm] = idx + 1  # 1-based row
+
+    def find_row(label):
+        n = _normalise_label(label)
+        if n in norm_to_row:
+            return norm_to_row[n]
+        # fall back to prefix match: sheet label may extend the metric label
+        # (e.g. metric "Missing Component" -> sheet "Missing Component - Needs Attention")
+        for sheet_norm, r in norm_to_row.items():
+            if sheet_norm.startswith(n):
+                return r
+        return None
+
+    data = [{"range": f"'{STATUS_TAB}'!{letter}1", "values": [[date_label]]}]
+    missing = []
+    for label, value in status_metrics:
+        r = find_row(label)
+        if r is None:
+            missing.append(label)
+            continue
+        data.append({"range": f"'{STATUS_TAB}'!{letter}{r}", "values": [[value]]})
+
+    if missing:
+        raise RuntimeError(
+            f"Could not find these row labels in column A of '{STATUS_TAB}': "
+            f"{missing}. Each metric must match (a prefix of) a label in column A. "
+            f"Fix the sheet's row labels and re-run — no data was written."
+        )
+
+    svc.spreadsheets().values().batchUpdate(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        body={"valueInputOption": "USER_ENTERED", "data": data},
     ).execute()
     return letter
 
@@ -377,11 +433,12 @@ def main():
     print(f"  In Progress: {len(in_prog)}")
     print(f"  Open:        {len(open_i)}")
 
-    status_values = build_status_column(delivered, finished, in_prog, open_i)
+    status_metrics = build_status_column(delivered, finished, in_prog, open_i)
     proj_rows, total_row = build_project_table(delivered, finished, in_prog, open_i)
-    jira_total = status_values[-2]   # JIRA Total is the second-to-last row (before ZD)
+    status_map = dict(status_metrics)
+    jira_total = status_map["JIRA Total"]
     print(f"  JIRA Total:  {jira_total}")
-    print(f"  Missing component (Open): {status_values[8]}")
+    print(f"  Missing component (Open): {status_map['Missing Component']}")
     print(f"  Projects:    {len(proj_rows)} rows, grand total {total_row[1]}")
 
     if jira_total != total_row[1]:
@@ -394,7 +451,7 @@ def main():
 
     svc = sheets_service()
     label = thursday_label()
-    col = append_status_column(svc, status_values, label)
+    col = append_status_column(svc, status_metrics, label)
     print(f"Wrote status column '{label}' to {STATUS_TAB}!{col}")
     overwrite_project_table(svc, proj_rows, total_row)
     print(f"Overwrote {PROJECT_TAB} with {len(proj_rows)} project rows")
